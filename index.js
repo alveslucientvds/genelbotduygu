@@ -111,17 +111,9 @@ const BLOCKED_COMMANDS = new Set([
   "terminal"
 ]);
 
-/**
- * Discord token benzeri stringleri yakalamak için kaba ama iş görür bir desen.
- * Tam doğrulama yapmaz; amacı sızıntıyı erken kesmek.
- */
 const DISCORD_TOKEN_LIKE_REGEX =
   /\b[A-Za-z0-9_-]{20,30}\.[A-Za-z0-9_-]{6,10}\.[A-Za-z0-9_-]{20,40}\b/g;
 
-/**
- * Çok saldırgan patternler. Bunları gördüğümüzde komut olarak işleme almayız.
- * Her mesajı cezalandırmak yerine bot tarafında tepkiyi kesiyoruz.
- */
 const SUSPICIOUS_CONTENT_REGEX =
   /\b(eval|new Function|child_process|execSync|spawn|fork|process\.env|client\.token|Buffer\.from\s*\(.+base64|require\s*\(\s*['"`]child_process['"`]\s*\))\b/i;
 
@@ -273,6 +265,23 @@ function cleanupCooldowns() {
       cooldowns.delete(userId);
     }
   }
+}
+
+function isAdminMember(member, guild) {
+  if (!member || !guild) return false;
+
+  return (
+    member.permissions.has(PermissionsBitField.Flags.Administrator) ||
+    member.id === guild.ownerId
+  );
+}
+
+async function deleteMessageSilently(message) {
+  try {
+    if (message.deletable) {
+      await message.delete().catch(() => null);
+    }
+  } catch {}
 }
 
 async function getOrCreateSpecialRole(guild) {
@@ -457,9 +466,11 @@ async function tryDeleteSensitiveMessage(message) {
   await message.delete().catch(() => null);
 
   try {
-    await message.author.send(
-      "Güvenlik nedeniyle token benzeri görünen bir mesajın silindi. Bot tokenini veya benzer hassas verileri paylaşma."
-    ).catch(() => null);
+    await message.author
+      .send(
+        "Güvenlik nedeniyle token benzeri görünen bir mesajın silindi. Bot tokenini veya benzer hassas verileri paylaşma."
+      )
+      .catch(() => null);
   } catch {}
 
   return true;
@@ -507,18 +518,12 @@ client.on("messageCreate", async (message) => {
     if (!message.guild) return;
     if (message.author.bot) return;
 
-    // Token leak protection: prefix olmasa bile hassas şeyi silmeyi dener.
     await tryDeleteSensitiveMessage(message);
 
     if (!message.content.startsWith(PREFIX)) return;
 
-    // Spam azaltma
-    if (isOnCooldown(message.author.id)) return;
-
     const raw = message.content.slice(PREFIX.length).trim();
     if (!raw) return;
-
-    // Aşırı uzun komut inputlarını erken kes
     if (raw.length > 500) return;
 
     const args = raw.split(/\s+/);
@@ -527,37 +532,50 @@ client.on("messageCreate", async (message) => {
 
     if (!command) return;
 
-    // Bilinmeyen komutları sessizce geç
     if (!ALLOWED_COMMANDS.has(command) && !BLOCKED_COMMANDS.has(command)) {
       return;
     }
 
-    // Eval / exec / token / shell vb. koruma
     if (BLOCKED_COMMANDS.has(command)) {
-      return message.reply("Bu komut güvenlik nedeniyle kapalı.");
+      await deleteMessageSilently(message);
+      return;
     }
 
-    // Komut içeriğinde şüpheli pattern varsa işleme alma
     if (SUSPICIOUS_CONTENT_REGEX.test(raw)) {
-      return message.reply("Şüpheli komut girdisi engellendi.");
+      await deleteMessageSilently(message);
+      return;
+    }
+
+    const helpCommands = new Set(["yardim", "yardım", "help"]);
+    const adminOnlyCommands = new Set(["vip", "nuke"]);
+
+    if (helpCommands.has(command)) {
+      if (!isAdminMember(message.member, message.guild)) {
+        await deleteMessageSilently(message);
+        return;
+      }
+    }
+
+    if (adminOnlyCommands.has(command)) {
+      if (isOnCooldown(message.author.id)) return;
+    } else {
+      if (isOnCooldown(message.author.id)) return;
     }
 
     if (command === "yardim" || command === "yardım" || command === "help") {
-      if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-        return;
-      }
-
       const embed = new EmbedBuilder()
         .setColor(0x2b2d31)
         .setTitle("Komutlar")
-        .setDescription([
-          `\`${PREFIX}av\` → Kendi avatarını gösterir`,
-          `\`${PREFIX}av @user\` → Etiketlenen kişinin avatarını gösterir`,
-          `\`${PREFIX}spotify\` / \`${PREFIX}spo\` → Spotify bilgisi`,
-          `\`${PREFIX}spotify @user\` → Etiketlenen kişinin Spotify bilgisi`,
-          `\`${PREFIX}vip @user\` veya \`${PREFIX}vip ID\` → Special rolü verir`,
-          `\`${PREFIX}nuke\` → Bulunduğun kanalı sıfırlar`
-        ].join("\n"))
+        .setDescription(
+          [
+            `\`${PREFIX}av\` → Kendi avatarını gösterir`,
+            `\`${PREFIX}av @user\` → Etiketlenen kişinin avatarını gösterir`,
+            `\`${PREFIX}spotify\` / \`${PREFIX}spo\` → Spotify bilgisi`,
+            `\`${PREFIX}spotify @user\` → Etiketlenen kişinin Spotify bilgisi`,
+            `\`${PREFIX}vip @user\` veya \`${PREFIX}vip ID\` → Special rolü verir`,
+            `\`${PREFIX}nuke\` → Bulunduğun kanalı sıfırlar`
+          ].join("\n")
+        )
         .setFooter({ text: `${message.guild.name}` });
 
       return message.reply({ embeds: [embed] });
@@ -634,7 +652,7 @@ client.on("messageCreate", async (message) => {
 
     if (command === "vip") {
       if (!message.member.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
-        return message.reply("Bu komutu kullanmak için `Rolleri Yönet` yetkin olmalı.");
+        return;
       }
 
       const targetMember = await resolveMember(message, restText);
@@ -662,7 +680,7 @@ client.on("messageCreate", async (message) => {
 
     if (command === "nuke") {
       if (!message.member.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
-        return message.reply("Bu komutu kullanmak için `Kanalları Yönet` yetkin olmalı.");
+        return;
       }
 
       const oldChannel = message.channel;
@@ -680,7 +698,9 @@ client.on("messageCreate", async (message) => {
       });
 
       if (oldParentId) {
-        await newChannel.setParent(oldParentId, { lockPermissions: false }).catch(() => null);
+        await newChannel
+          .setParent(oldParentId, { lockPermissions: false })
+          .catch(() => null);
       }
 
       await newChannel.setPosition(oldPosition).catch(() => null);
