@@ -81,63 +81,145 @@ let voiceReconnectLock = false;
 let voiceReconnectTimeout = null;
 let trackedVoiceGuildId = null;
 
+const cooldowns = new Map();
+const COMMAND_COOLDOWN_MS = 3000;
+
+/* =================================
+   SECURITY CONFIG
+================================= */
+const ALLOWED_COMMANDS = new Set([
+  "yardim",
+  "yardım",
+  "help",
+  "av",
+  "spotify",
+  "spo",
+  "vip",
+  "nuke"
+]);
+
+const BLOCKED_COMMANDS = new Set([
+  "eval",
+  "exec",
+  "token",
+  "shell",
+  "cmd",
+  "powershell",
+  "bash",
+  "debug",
+  "console",
+  "terminal"
+]);
+
+/**
+ * Discord token benzeri stringleri yakalamak için kaba ama iş görür bir desen.
+ * Tam doğrulama yapmaz; amacı sızıntıyı erken kesmek.
+ */
+const DISCORD_TOKEN_LIKE_REGEX =
+  /\b[A-Za-z0-9_-]{20,30}\.[A-Za-z0-9_-]{6,10}\.[A-Za-z0-9_-]{20,40}\b/g;
+
+/**
+ * Çok saldırgan patternler. Bunları gördüğümüzde komut olarak işleme almayız.
+ * Her mesajı cezalandırmak yerine bot tarafında tepkiyi kesiyoruz.
+ */
+const SUSPICIOUS_CONTENT_REGEX =
+  /\b(eval|new Function|child_process|execSync|spawn|fork|process\.env|client\.token|Buffer\.from\s*\(.+base64|require\s*\(\s*['"`]child_process['"`]\s*\))\b/i;
+
+/* =================================
+   SAFE LOGGING / REDACTION
+================================= */
+function redactSensitive(input) {
+  if (input == null) return input;
+
+  let text;
+  try {
+    text = typeof input === "string" ? input : JSON.stringify(input, null, 2);
+  } catch {
+    text = String(input);
+  }
+
+  if (TOKEN) {
+    text = text.split(TOKEN).join("[REDACTED_TOKEN]");
+  }
+
+  text = text.replace(DISCORD_TOKEN_LIKE_REGEX, "[REDACTED_TOKEN_LIKE]");
+  return text;
+}
+
+function safeLog(...args) {
+  console.log(...args.map(redactSensitive));
+}
+
+function safeError(...args) {
+  console.error(...args.map(redactSensitive));
+}
+
 process.on("unhandledRejection", (reason) => {
-  console.error("[unhandledRejection]", reason);
+  safeError("[unhandledRejection]", reason);
 });
 
 process.on("uncaughtException", (error) => {
-  console.error("[uncaughtException]", error);
+  safeError("[uncaughtException]", error);
 });
 
 process.on("uncaughtExceptionMonitor", (error) => {
-  console.error("[uncaughtExceptionMonitor]", error);
+  safeError("[uncaughtExceptionMonitor]", error);
 });
 
 process.on("SIGTERM", async () => {
-  console.log("[SIGTERM] Kapatılıyor...");
+  safeLog("[SIGTERM] Kapatılıyor...");
   try {
+    clearReconnectTimer();
     for (const guild of client.guilds.cache.values()) {
       const conn = getVoiceConnection(guild.id);
       if (conn) conn.destroy();
     }
     client.destroy();
   } catch (err) {
-    console.error("[SIGTERM destroy error]", err);
+    safeError("[SIGTERM destroy error]", err);
   } finally {
     process.exit(0);
   }
 });
 
 process.on("SIGINT", async () => {
-  console.log("[SIGINT] Kapatılıyor...");
+  safeLog("[SIGINT] Kapatılıyor...");
   try {
+    clearReconnectTimer();
     for (const guild of client.guilds.cache.values()) {
       const conn = getVoiceConnection(guild.id);
       if (conn) conn.destroy();
     }
     client.destroy();
   } catch (err) {
-    console.error("[SIGINT destroy error]", err);
+    safeError("[SIGINT destroy error]", err);
   } finally {
     process.exit(0);
   }
 });
 
 client.on("error", (err) => {
-  console.error("[client error]", err);
+  safeError("[client error]", err);
 });
 
 client.on("warn", (info) => {
-  console.warn("[client warn]", info);
+  safeLog("[client warn]", info);
 });
 
 client.on("shardError", (err) => {
-  console.error("[shard error]", err);
+  safeError("[shard error]", err);
 });
 
 /* =================================
    HELPERS
 ================================= */
+function normalizeCommandName(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFKC");
+}
+
 function formatDuration(ms) {
   if (!ms || Number.isNaN(ms) || ms < 0) return "Bilinmiyor";
 
@@ -151,10 +233,10 @@ function formatDuration(ms) {
 function parseUserId(input) {
   if (!input) return null;
 
-  const mention = input.match(/^<@!?(\d+)>$/);
+  const mention = String(input).match(/^<@!?(\d+)>$/);
   if (mention) return mention[1];
 
-  const rawId = input.match(/^(\d{17,20})$/);
+  const rawId = String(input).match(/^(\d{17,20})$/);
   if (rawId) return rawId[1];
 
   return null;
@@ -171,6 +253,25 @@ async function resolveMember(message, text) {
     return await message.guild.members.fetch(id);
   } catch {
     return null;
+  }
+}
+
+function isOnCooldown(userId) {
+  const now = Date.now();
+  const last = cooldowns.get(userId) || 0;
+
+  if (now - last < COMMAND_COOLDOWN_MS) return true;
+
+  cooldowns.set(userId, now);
+  return false;
+}
+
+function cleanupCooldowns() {
+  const now = Date.now();
+  for (const [userId, last] of cooldowns.entries()) {
+    if (now - last > COMMAND_COOLDOWN_MS * 3) {
+      cooldowns.delete(userId);
+    }
   }
 }
 
@@ -218,16 +319,16 @@ async function connectToConfiguredVoice() {
   try {
     const channel = await getTargetVoiceChannel();
     if (!channel) {
-      console.log("[VOICE] Hedef ses kanalı bulunamadı veya geçersiz.");
+      safeLog("[VOICE] Hedef ses kanalı bulunamadı veya geçersiz.");
       return null;
     }
 
     const guild = channel.guild;
     trackedVoiceGuildId = guild.id;
 
-    const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
+    const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
     if (!me) {
-      console.log("[VOICE] Bot member bilgisi alınamadı.");
+      safeLog("[VOICE] Bot member bilgisi alınamadı.");
       return null;
     }
 
@@ -237,7 +338,7 @@ async function connectToConfiguredVoice() {
       !perms.has(PermissionsBitField.Flags.ViewChannel) ||
       !perms.has(PermissionsBitField.Flags.Connect)
     ) {
-      console.log("[VOICE] Ses kanalına bağlanma yetkisi yok.");
+      safeLog("[VOICE] Ses kanalına bağlanma yetkisi yok.");
       return null;
     }
 
@@ -258,7 +359,7 @@ async function connectToConfiguredVoice() {
       try {
         existing.destroy();
       } catch (err) {
-        console.error("[VOICE] Eski bağlantı silinirken hata:", err);
+        safeError("[VOICE] Eski bağlantı silinirken hata:", err);
       }
     }
 
@@ -271,7 +372,7 @@ async function connectToConfiguredVoice() {
     });
 
     connection.on("stateChange", (oldState, newState) => {
-      console.log(`[VOICE] ${oldState.status} -> ${newState.status}`);
+      safeLog(`[VOICE] ${oldState.status} -> ${newState.status}`);
 
       if (
         newState.status === VoiceConnectionStatus.Disconnected ||
@@ -282,17 +383,17 @@ async function connectToConfiguredVoice() {
     });
 
     connection.on("error", (err) => {
-      console.error("[VOICE connection error]", err);
+      safeError("[VOICE connection error]", err);
       scheduleVoiceReconnect();
     });
 
     await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-    console.log(`[VOICE] Bağlandı: ${channel.name}`);
+    safeLog(`[VOICE] Bağlandı: ${channel.name}`);
 
     clearReconnectTimer();
     return connection;
   } catch (err) {
-    console.error("[VOICE] Bağlanırken hata:", err);
+    safeError("[VOICE] Bağlanırken hata:", err);
     scheduleVoiceReconnect();
     return null;
   } finally {
@@ -320,7 +421,7 @@ async function voiceWatchdog() {
     const conn = getVoiceConnection(trackedVoiceGuildId);
 
     if (!conn) {
-      console.log("[VOICE WATCHDOG] Connection yok, tekrar bağlanılıyor.");
+      safeLog("[VOICE WATCHDOG] Connection yok, tekrar bağlanılıyor.");
       await connectToConfiguredVoice();
       return;
     }
@@ -333,22 +434,42 @@ async function voiceWatchdog() {
       state === VoiceConnectionStatus.Destroyed ||
       state === VoiceConnectionStatus.Disconnected
     ) {
-      console.log("[VOICE WATCHDOG] Connection bozuk, tekrar bağlanılıyor.");
+      safeLog("[VOICE WATCHDOG] Connection bozuk, tekrar bağlanılıyor.");
       try {
         conn.destroy();
       } catch {}
       await connectToConfiguredVoice();
     }
   } catch (err) {
-    console.error("[VOICE WATCHDOG ERROR]", err);
+    safeError("[VOICE WATCHDOG ERROR]", err);
   }
+}
+
+async function tryDeleteSensitiveMessage(message) {
+  if (!message.guild) return false;
+  if (!message.deletable) return false;
+
+  const hasTokenLike = DISCORD_TOKEN_LIKE_REGEX.test(message.content);
+  DISCORD_TOKEN_LIKE_REGEX.lastIndex = 0;
+
+  if (!hasTokenLike) return false;
+
+  await message.delete().catch(() => null);
+
+  try {
+    await message.author.send(
+      "Güvenlik nedeniyle token benzeri görünen bir mesajın silindi. Bot tokenini veya benzer hassas verileri paylaşma."
+    ).catch(() => null);
+  } catch {}
+
+  return true;
 }
 
 /* =================================
    READY
 ================================= */
 client.once("clientReady", async () => {
-  console.log(`[READY] ${client.user.tag} giriş yaptı.`);
+  safeLog(`[READY] ${client.user.tag} giriş yaptı.`);
 
   try {
     client.user.setPresence({
@@ -361,18 +482,22 @@ client.once("clientReady", async () => {
       ]
     });
   } catch (err) {
-    console.error("[PRESENCE ERROR]", err);
+    safeError("[PRESENCE ERROR]", err);
   }
 
   await connectToConfiguredVoice();
 });
 
 /* =================================
-   VOICE WATCHDOG
+   INTERVALS
 ================================= */
 setInterval(async () => {
   await voiceWatchdog();
 }, 120_000);
+
+setInterval(() => {
+  cleanupCooldowns();
+}, 60_000);
 
 /* =================================
    COMMANDS
@@ -381,15 +506,47 @@ client.on("messageCreate", async (message) => {
   try {
     if (!message.guild) return;
     if (message.author.bot) return;
+
+    // Token leak protection: prefix olmasa bile hassas şeyi silmeyi dener.
+    await tryDeleteSensitiveMessage(message);
+
     if (!message.content.startsWith(PREFIX)) return;
 
-    const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
-    const command = (args.shift() || "").toLowerCase();
-    const restText = args.join(" ");
+    // Spam azaltma
+    if (isOnCooldown(message.author.id)) return;
+
+    const raw = message.content.slice(PREFIX.length).trim();
+    if (!raw) return;
+
+    // Aşırı uzun komut inputlarını erken kes
+    if (raw.length > 500) return;
+
+    const args = raw.split(/\s+/);
+    const command = normalizeCommandName(args.shift());
+    const restText = args.join(" ").trim();
 
     if (!command) return;
 
-    if (command === "yardim" || command === "help") {
+    // Bilinmeyen komutları sessizce geç
+    if (!ALLOWED_COMMANDS.has(command) && !BLOCKED_COMMANDS.has(command)) {
+      return;
+    }
+
+    // Eval / exec / token / shell vb. koruma
+    if (BLOCKED_COMMANDS.has(command)) {
+      return message.reply("Bu komut güvenlik nedeniyle kapalı.");
+    }
+
+    // Komut içeriğinde şüpheli pattern varsa işleme alma
+    if (SUSPICIOUS_CONTENT_REGEX.test(raw)) {
+      return message.reply("Şüpheli komut girdisi engellendi.");
+    }
+
+    if (command === "yardim" || command === "yardım" || command === "help") {
+      if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+        return;
+      }
+
       const embed = new EmbedBuilder()
         .setColor(0x2b2d31)
         .setTitle("Komutlar")
@@ -414,7 +571,7 @@ client.on("messageCreate", async (message) => {
       });
 
       const embed = new EmbedBuilder()
-        .setColor(0x5865F2)
+        .setColor(0x5865f2)
         .setTitle(`${member.user.tag} avatarı`)
         .setImage(avatar)
         .setDescription(`[Tarayıcıda aç](${avatar})`);
@@ -455,7 +612,7 @@ client.on("messageCreate", async (message) => {
         : null;
 
       const embed = new EmbedBuilder()
-        .setColor(0x1DB954)
+        .setColor(0x1db954)
         .setAuthor({ name: `${member.user.tag} Spotify dinliyor` })
         .addFields(
           { name: "Şarkı", value: track, inline: false },
@@ -486,7 +643,7 @@ client.on("messageCreate", async (message) => {
       }
 
       const role = await getOrCreateSpecialRole(message.guild);
-      const me = message.guild.members.me || await message.guild.members.fetchMe();
+      const me = message.guild.members.me || (await message.guild.members.fetchMe());
 
       if (role.position >= me.roles.highest.position) {
         return message.reply(
@@ -527,13 +684,11 @@ client.on("messageCreate", async (message) => {
       }
 
       await newChannel.setPosition(oldPosition).catch(() => null);
-
       await oldChannel.delete(`${message.author.tag} tarafından nuke kullanıldı`);
-
       await newChannel.setPosition(oldPosition).catch(() => null);
 
       const embed = new EmbedBuilder()
-        .setColor(0xFF3B30)
+        .setColor(0xff3b30)
         .setTitle("💥 Kanal Nukelendi")
         .setDescription(`Bu kanal ${message.author} tarafından yenilendi.`);
 
@@ -544,7 +699,7 @@ client.on("messageCreate", async (message) => {
       return;
     }
   } catch (error) {
-    console.error("[COMMAND ERROR]", error);
+    safeError("[COMMAND ERROR]", error);
     try {
       await message.reply("Komut çalışırken bir hata oluştu.");
     } catch {}
@@ -554,4 +709,7 @@ client.on("messageCreate", async (message) => {
 /* =================================
    LOGIN
 ================================= */
-client.login(TOKEN);
+client.login(TOKEN).catch((err) => {
+  safeError("[LOGIN ERROR]", err);
+  process.exit(1);
+});
