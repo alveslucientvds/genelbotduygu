@@ -7,86 +7,137 @@ const {
   Partials,
   PermissionsBitField,
   EmbedBuilder,
-  ChannelType
+  ChannelType,
+  ActivityType
 } = require("discord.js");
+
 const {
   joinVoiceChannel,
   getVoiceConnection,
-  VoiceConnectionStatus,
-  entersState
+  entersState,
+  VoiceConnectionStatus
 } = require("@discordjs/voice");
 
-/* =========================
-   BASIC CONFIG
-========================= */
+/* =================================
+   ENV
+================================= */
 const TOKEN = process.env.TOKEN;
 const PREFIX = process.env.PREFIX || ".";
 const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID || "";
 const STATUS_TEXT = process.env.STATUS_TEXT || ".yardim | klasik bot";
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 if (!TOKEN) {
-  console.error("TOKEN .env içinde eksik.");
+  console.error("[FATAL] TOKEN bulunamadı.");
   process.exit(1);
 }
 
+/* =================================
+   EXPRESS KEEPALIVE
+================================= */
+const app = express();
+
+app.get("/", (req, res) => {
+  res.status(200).send("Bot aktif");
+});
+
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    bot: client?.user?.tag || null,
+    uptime: process.uptime(),
+    memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.use((req, res) => {
+  res.status(200).send("OK");
+});
+
+app.listen(PORT, () => {
+  console.log(`[WEB] Server ${PORT} portunda aktif.`);
+});
+
+/* =================================
+   CLIENT
+================================= */
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildPresences,
     GatewayIntentBits.GuildVoiceStates
   ],
   partials: [Partials.Channel]
 });
 
-/* =========================
-   KEEP ALIVE SERVER
-========================= */
-const app = express();
+/* =================================
+   GLOBAL SAFETY
+================================= */
+let reconnectingVoice = false;
 
-app.get("/", (req, res) => {
-  res.status(200).send("Bot aktif.");
-});
-
-app.get("/health", (req, res) => {
-  res.status(200).json({
-    ok: true,
-    bot: client.user ? client.user.tag : "not-ready",
-    uptimeSec: Math.floor(process.uptime())
-  });
-});
-
-app.use((req, res) => {
-  res.status(200).send("Bot aktif.");
-});
-
-app.listen(PORT, () => {
-  console.log(`Web server aktif: ${PORT}`);
-});
-
-/* =========================
-   CRASH GUARD
-========================= */
 process.on("unhandledRejection", (reason) => {
-  console.error("Unhandled Rejection:", reason);
+  console.error("[unhandledRejection]", reason);
 });
 
 process.on("uncaughtException", (error) => {
-  console.error("Uncaught Exception:", error);
+  console.error("[uncaughtException]", error);
 });
 
 process.on("uncaughtExceptionMonitor", (error) => {
-  console.error("Uncaught Exception Monitor:", error);
+  console.error("[uncaughtExceptionMonitor]", error);
 });
 
-/* =========================
+process.on("SIGTERM", async () => {
+  console.log("[SIGTERM] Kapatılıyor...");
+  try {
+    for (const guild of client.guilds.cache.values()) {
+      const conn = getVoiceConnection(guild.id);
+      if (conn) conn.destroy();
+    }
+    client.destroy();
+  } catch (err) {
+    console.error("[SIGTERM destroy error]", err);
+  } finally {
+    process.exit(0);
+  }
+});
+
+process.on("SIGINT", async () => {
+  console.log("[SIGINT] Kapatılıyor...");
+  try {
+    for (const guild of client.guilds.cache.values()) {
+      const conn = getVoiceConnection(guild.id);
+      if (conn) conn.destroy();
+    }
+    client.destroy();
+  } catch (err) {
+    console.error("[SIGINT destroy error]", err);
+  } finally {
+    process.exit(0);
+  }
+});
+
+client.on("error", (err) => {
+  console.error("[client error]", err);
+});
+
+client.on("warn", (info) => {
+  console.warn("[client warn]", info);
+});
+
+client.on("shardError", (err) => {
+  console.error("[shard error]", err);
+});
+
+/* =================================
    HELPERS
-========================= */
+================================= */
 function formatDuration(ms) {
-  if (!ms || Number.isNaN(ms)) return "Bilinmiyor";
+  if (!ms || Number.isNaN(ms) || ms < 0) return "Bilinmiyor";
 
   const totalSeconds = Math.floor(ms / 1000);
   const minutes = Math.floor(totalSeconds / 60);
@@ -95,32 +146,33 @@ function formatDuration(ms) {
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
-function resolveTargetId(text) {
-  if (!text) return null;
-  const mentionMatch = text.match(/^<@!?(\d+)>$/);
-  if (mentionMatch) return mentionMatch[1];
+function parseUserId(input) {
+  if (!input) return null;
 
-  const idMatch = text.match(/^(\d{17,20})$/);
-  if (idMatch) return idMatch[1];
+  const mention = input.match(/^<@!?(\d+)>$/);
+  if (mention) return mention[1];
+
+  const rawId = input.match(/^(\d{17,20})$/);
+  if (rawId) return rawId[1];
 
   return null;
 }
 
-async function resolveMember(message, argText) {
-  const mention = message.mentions.members.first();
-  if (mention) return mention;
+async function resolveMember(message, text) {
+  const mentioned = message.mentions.members.first();
+  if (mentioned) return mentioned;
 
-  const targetId = resolveTargetId(argText);
-  if (!targetId) return null;
+  const id = parseUserId(text);
+  if (!id) return null;
 
   try {
-    return await message.guild.members.fetch(targetId);
+    return await message.guild.members.fetch(id);
   } catch {
     return null;
   }
 }
 
-async function ensureSpecialRole(guild) {
+async function getOrCreateSpecialRole(guild) {
   let role = guild.roles.cache.find((r) => r.name === "Special");
 
   if (!role) {
@@ -133,13 +185,16 @@ async function ensureSpecialRole(guild) {
   return role;
 }
 
-async function safeAutoJoinVoice() {
-  try {
-    if (!VOICE_CHANNEL_ID) return;
+async function autoJoinVoice(force = false) {
+  if (!VOICE_CHANNEL_ID) return;
+  if (reconnectingVoice) return;
 
+  reconnectingVoice = true;
+
+  try {
     const channel = await client.channels.fetch(VOICE_CHANNEL_ID).catch(() => null);
     if (!channel) {
-      console.log("Auto join iptal: ses kanalı bulunamadı.");
+      console.log("[VOICE] Kanal bulunamadı.");
       return;
     }
 
@@ -147,27 +202,44 @@ async function safeAutoJoinVoice() {
       channel.type !== ChannelType.GuildVoice &&
       channel.type !== ChannelType.GuildStageVoice
     ) {
-      console.log("VOICE_CHANNEL_ID bir ses kanalı değil.");
+      console.log("[VOICE] VOICE_CHANNEL_ID bir ses kanalı değil.");
       return;
     }
 
     const guild = channel.guild;
-    const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
-    if (!me) return;
+    const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
+
+    if (!me) {
+      console.log("[VOICE] Bot member bilgisi alınamadı.");
+      return;
+    }
 
     const perms = channel.permissionsFor(me);
     if (
       !perms ||
-      !perms.has(PermissionsBitField.Flags.Connect) ||
-      !perms.has(PermissionsBitField.Flags.ViewChannel)
+      !perms.has(PermissionsBitField.Flags.ViewChannel) ||
+      !perms.has(PermissionsBitField.Flags.Connect)
     ) {
-      console.log("Botun ses kanalına girme izni yok.");
+      console.log("[VOICE] Ses kanalına girme yetkisi yok.");
       return;
     }
 
     const existing = getVoiceConnection(guild.id);
-    if (existing && existing.joinConfig.channelId === channel.id) {
+
+    if (
+      existing &&
+      existing.joinConfig.channelId === channel.id &&
+      !force
+    ) {
       return;
+    }
+
+    if (existing) {
+      try {
+        existing.destroy();
+      } catch (e) {
+        console.error("[VOICE] Eski bağlantı silinemedi:", e);
+      }
     }
 
     const connection = joinVoiceChannel({
@@ -178,74 +250,107 @@ async function safeAutoJoinVoice() {
       selfMute: false
     });
 
+    connection.on("stateChange", (oldState, newState) => {
+      console.log(`[VOICE] ${oldState.status} -> ${newState.status}`);
+    });
+
+    connection.on("error", (err) => {
+      console.error("[VOICE connection error]", err);
+    });
+
     try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
-      console.log(`Ses kanalına bağlandı: ${channel.name}`);
+      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+      console.log(`[VOICE] Başarıyla bağlandı: ${channel.name}`);
     } catch (err) {
-      console.error("Voice ready hatası:", err);
-      connection.destroy();
+      console.error("[VOICE] Ready olunamadı:", err);
+      try {
+        connection.destroy();
+      } catch {}
     }
   } catch (error) {
-    console.error("safeAutoJoinVoice hatası:", error);
+    console.error("[VOICE autoJoinVoice error]", error);
+  } finally {
+    reconnectingVoice = false;
   }
 }
 
-/* =========================
-   READY
-========================= */
-client.once("ready", async () => {
-  console.log(`${client.user.tag} olarak giriş yapıldı.`);
-
-  client.user.setPresence({
-    activities: [
-      {
-        name: STATUS_TEXT,
-        type: 0
-      }
-    ],
-    status: "idle"
-  });
-
-  await safeAutoJoinVoice();
-});
-
-/* =========================
-   VOICE RE-JOIN
-========================= */
-client.on("voiceStateUpdate", async () => {
+async function ensureVoiceConnection() {
   if (!VOICE_CHANNEL_ID || !client.user) return;
 
   const channel = await client.channels.fetch(VOICE_CHANNEL_ID).catch(() => null);
   if (!channel || !channel.guild) return;
 
-  const connection = getVoiceConnection(channel.guild.id);
+  const conn = getVoiceConnection(channel.guild.id);
 
-  if (!connection) {
-    await safeAutoJoinVoice();
+  if (!conn) {
+    await autoJoinVoice(true);
     return;
   }
 
-  const currentChannelId = connection.joinConfig.channelId;
-  if (currentChannelId !== VOICE_CHANNEL_ID) {
+  if (conn.joinConfig.channelId !== VOICE_CHANNEL_ID) {
     try {
-      connection.destroy();
+      conn.destroy();
     } catch {}
-    await safeAutoJoinVoice();
+    await autoJoinVoice(true);
+  }
+}
+
+/* =================================
+   READY
+================================= */
+client.once("clientReady", async () => {
+  console.log(`[READY] ${client.user.tag} giriş yaptı.`);
+
+  try {
+    client.user.setPresence({
+      status: "idle",
+      activities: [
+        {
+          name: STATUS_TEXT,
+          type: ActivityType.Watching
+        }
+      ]
+    });
+  } catch (err) {
+    console.error("[PRESENCE ERROR]", err);
+  }
+
+  await autoJoinVoice();
+});
+
+/* =================================
+   VOICE WATCHDOG
+================================= */
+setInterval(async () => {
+  try {
+    await ensureVoiceConnection();
+  } catch (err) {
+    console.error("[VOICE WATCHDOG ERROR]", err);
+  }
+}, 60_000);
+
+client.on("voiceStateUpdate", async () => {
+  try {
+    await ensureVoiceConnection();
+  } catch (err) {
+    console.error("[voiceStateUpdate ensureVoiceConnection]", err);
   }
 });
 
-/* =========================
+/* =================================
    COMMANDS
-========================= */
+================================= */
 client.on("messageCreate", async (message) => {
   try {
     if (!message.guild) return;
     if (message.author.bot) return;
-    if (!message.content.toLowerCase().startsWith(PREFIX.toLowerCase())) return;
+    if (!message.content.startsWith(PREFIX)) return;
 
     const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
     const command = (args.shift() || "").toLowerCase();
     const restText = args.join(" ");
+
+    if (!command) return;
 
     /* =========================
        .yardim
@@ -254,16 +359,14 @@ client.on("messageCreate", async (message) => {
       const embed = new EmbedBuilder()
         .setColor(0x2b2d31)
         .setTitle("Komutlar")
-        .setDescription(
-          [
-            `\`${PREFIX}av\` → Kendi avatarını gösterir`,
-            `\`${PREFIX}av @user\` → Etiketlenen kişinin avatarını gösterir`,
-            `\`${PREFIX}spotify\` / \`${PREFIX}spo\` → Kendi Spotify bilgisini gösterir`,
-            `\`${PREFIX}spotify @user\` / \`${PREFIX}spo @user\` → Başkasının Spotify bilgisini gösterir`,
-            `\`${PREFIX}vip @user\` veya \`${PREFIX}vip ID\` → Special rolü verir`,
-            `\`${PREFIX}nuke\` → Bulunduğun kanalı silip aynı izinlerle tekrar açar`
-          ].join("\n")
-        )
+        .setDescription([
+          `\`${PREFIX}av\` → Kendi avatarını gösterir`,
+          `\`${PREFIX}av @user\` → Etiketlenen kişinin avatarını gösterir`,
+          `\`${PREFIX}spotify\` / \`${PREFIX}spo\` → Spotify bilgisi`,
+          `\`${PREFIX}spotify @user\` → Etiketlenen kişinin Spotify bilgisi`,
+          `\`${PREFIX}vip @user\` veya \`${PREFIX}vip ID\` → Special rolü verir`,
+          `\`${PREFIX}nuke\` → Bulunduğun kanalı sıfırlar`
+        ].join("\n"))
         .setFooter({ text: `${message.guild.name}` });
 
       return message.reply({ embeds: [embed] });
@@ -274,13 +377,16 @@ client.on("messageCreate", async (message) => {
     ========================= */
     if (command === "av") {
       const member = (await resolveMember(message, restText)) || message.member;
-      const avatarURL = member.user.displayAvatarURL({ size: 4096, extension: "png" });
+      const avatar = member.user.displayAvatarURL({
+        size: 4096,
+        extension: "png"
+      });
 
       const embed = new EmbedBuilder()
-        .setColor(0x5865f2)
+        .setColor(0x5865F2)
         .setTitle(`${member.user.tag} avatarı`)
-        .setImage(avatarURL)
-        .setDescription(`[Tarayıcıda aç](${avatarURL})`);
+        .setImage(avatar)
+        .setDescription(`[Tarayıcıda aç](${avatar})`);
 
       return message.reply({ embeds: [embed] });
     }
@@ -293,12 +399,12 @@ client.on("messageCreate", async (message) => {
 
       if (!member.presence) {
         return message.reply(
-          "Bu kullanıcının presence bilgisi görünmüyor. Developer Portal'da Presence Intent açık olmalı ve kullanıcı durumu görünür olmalı."
+          "Presence bilgisi görünmüyor. Developer Portal'da Presence Intent açık olmalı."
         );
       }
 
       const spotifyActivity = member.presence.activities.find(
-        (activity) => activity.name === "Spotify"
+        (a) => a.name === "Spotify"
       );
 
       if (!spotifyActivity) {
@@ -309,22 +415,20 @@ client.on("messageCreate", async (message) => {
       const artist = spotifyActivity.state || "Bilinmiyor";
       const album = spotifyActivity.assets?.largeText || "Bilinmiyor";
       const cover = spotifyActivity.assets?.largeImageURL?.() || null;
+
       const startedAt = spotifyActivity.timestamps?.start?.getTime?.() || null;
       const endsAt = spotifyActivity.timestamps?.end?.getTime?.() || null;
 
-      const elapsed = startedAt ? Date.now() - startedAt : null;
-      const total = startedAt && endsAt ? endsAt - startedAt : null;
+      const elapsed = startedAt ? (Date.now() - startedAt) : null;
+      const total = startedAt && endsAt ? (endsAt - startedAt) : null;
 
-      let spotifyUrl = null;
-      if (spotifyActivity.syncId) {
-        spotifyUrl = `https://open.spotify.com/track/${spotifyActivity.syncId}`;
-      }
+      const spotifyUrl = spotifyActivity.syncId
+        ? `https://open.spotify.com/track/${spotifyActivity.syncId}`
+        : null;
 
       const embed = new EmbedBuilder()
-        .setColor(0x1db954)
-        .setAuthor({
-          name: `${member.user.tag} Spotify dinliyor`
-        })
+        .setColor(0x1DB954)
+        .setAuthor({ name: `${member.user.tag} Spotify dinliyor` })
         .addFields(
           { name: "Şarkı", value: track, inline: false },
           { name: "Sanatçı", value: artist, inline: false },
@@ -335,7 +439,7 @@ client.on("messageCreate", async (message) => {
             inline: false
           }
         )
-        .setFooter({ text: "Spotify" });
+        .setFooter({ text: "Spotify Activity" });
 
       if (cover) embed.setThumbnail(cover);
       if (spotifyUrl) embed.setDescription(`[Spotify'da aç](${spotifyUrl})`);
@@ -348,32 +452,30 @@ client.on("messageCreate", async (message) => {
     ========================= */
     if (command === "vip") {
       if (!message.member.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
-        return message.reply("Bu komut için `Rolleri Yönet` yetkisine sahip olmalısın.");
+        return message.reply("Bu komutu kullanmak için `Rolleri Yönet` yetkin olmalı.");
       }
 
       const targetMember = await resolveMember(message, restText);
       if (!targetMember) {
-        return message.reply("Bir kullanıcı etiketle veya geçerli bir kullanıcı ID'si yaz.");
+        return message.reply("Bir kullanıcı etiketle veya geçerli bir ID yaz.");
       }
 
-      const specialRole = await ensureSpecialRole(message.guild);
+      const role = await getOrCreateSpecialRole(message.guild);
+      const me = message.guild.members.me || await message.guild.members.fetchMe();
 
-      const me = message.guild.members.me || (await message.guild.members.fetchMe());
-      if (specialRole.position >= me.roles.highest.position) {
+      if (role.position >= me.roles.highest.position) {
         return message.reply(
-          "Special rolü benim en yüksek rolümden yukarıda olduğu için veremiyorum. Bot rolünü daha üste taşı."
+          "Special rolü botun en yüksek rolünden yukarıda. Bot rolünü üste taşı."
         );
       }
 
-      if (targetMember.roles.cache.has(specialRole.id)) {
-        return message.reply(`${targetMember.user.tag} zaten Special rolüne sahip.`);
+      if (targetMember.roles.cache.has(role.id)) {
+        return message.reply("Bu kullanıcıda zaten Special rolü var.");
       }
 
-      await targetMember.roles.add(specialRole, `${message.author.tag} tarafından VIP verildi`);
+      await targetMember.roles.add(role, `${message.author.tag} tarafından VIP verildi`);
 
-      return message.reply(
-        `✅ ${targetMember.user.tag} kullanıcısına \`${specialRole.name}\` rolü verildi.`
-      );
+      return message.reply(`✅ ${targetMember.user.tag} kullanıcısına Special rolü verildi.`);
     }
 
     /* =========================
@@ -381,56 +483,53 @@ client.on("messageCreate", async (message) => {
     ========================= */
     if (command === "nuke") {
       if (!message.member.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
-        return message.reply("Bu komut için `Kanalları Yönet` yetkisine sahip olmalısın.");
+        return message.reply("Bu komutu kullanmak için `Kanalları Yönet` yetkin olmalı.");
       }
 
-      const channel = message.channel;
-      if (!channel || typeof channel.clone !== "function") {
-        return message.reply("Bu kanal türü nuke için uygun değil.");
+      const oldChannel = message.channel;
+      if (!oldChannel || typeof oldChannel.clone !== "function") {
+        return message.reply("Bu kanal nuke için uygun değil.");
       }
 
-      const oldPosition = channel.rawPosition;
-      const oldParentId = channel.parentId;
-      const oldName = channel.name;
+      const oldPosition = oldChannel.rawPosition;
+      const oldParentId = oldChannel.parentId;
+      const oldName = oldChannel.name;
 
-      const cloned = await channel.clone({
+      const newChannel = await oldChannel.clone({
         name: oldName,
-        reason: `${message.author.tag} tarafından nuke komutu kullanıldı`
+        reason: `${message.author.tag} tarafından nuke kullanıldı`
       });
 
       if (oldParentId) {
-        await cloned.setParent(oldParentId, { lockPermissions: false }).catch(() => null);
+        await newChannel.setParent(oldParentId, { lockPermissions: false }).catch(() => null);
       }
 
-      await cloned.setPosition(oldPosition).catch(() => null);
+      await newChannel.setPosition(oldPosition).catch(() => null);
 
-      await channel.delete(`${message.author.tag} tarafından nuke komutu kullanıldı`);
+      await oldChannel.delete(`${message.author.tag} tarafından nuke kullanıldı`);
 
-      await cloned.setPosition(oldPosition).catch(() => null);
+      await newChannel.setPosition(oldPosition).catch(() => null);
+
+      const embed = new EmbedBuilder()
+        .setColor(0xFF3B30)
+        .setTitle("💥 Kanal Nukelendi")
+        .setDescription(`Bu kanal ${message.author} tarafından yenilendi.`);
 
       try {
-        await cloned.send({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(0xff3b30)
-              .setTitle("💥 Kanal Nukelendi")
-              .setDescription(`Bu kanal ${message.author} tarafından yenilendi.`)
-          ]
-        });
+        await newChannel.send({ embeds: [embed] });
       } catch {}
 
       return;
     }
   } catch (error) {
-    console.error("Komut hatası:", error);
-
+    console.error("[COMMAND ERROR]", error);
     try {
       await message.reply("Komut çalışırken bir hata oluştu.");
     } catch {}
   }
 });
 
-/* =========================
+/* =================================
    LOGIN
-========================= */
+================================= */
 client.login(TOKEN);
