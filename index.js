@@ -33,33 +33,6 @@ if (!TOKEN) {
 }
 
 /* =================================
-   EXPRESS KEEPALIVE
-================================= */
-const app = express();
-
-app.get("/", (req, res) => {
-  res.status(200).send("Bot aktif");
-});
-
-app.get("/health", (req, res) => {
-  res.status(200).json({
-    ok: true,
-    bot: client?.user?.tag || null,
-    uptime: process.uptime(),
-    memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.use((req, res) => {
-  res.status(200).send("OK");
-});
-
-app.listen(PORT, () => {
-  console.log(`[WEB] Server ${PORT} portunda aktif.`);
-});
-
-/* =================================
    CLIENT
 ================================= */
 const client = new Client({
@@ -75,11 +48,57 @@ const client = new Client({
 });
 
 /* =================================
-   GLOBAL SAFETY
+   EXPRESS KEEPALIVE
+================================= */
+const app = express();
+app.disable("x-powered-by");
+
+app.get("/", (_req, res) => {
+  res.status(200).send("Bot aktif");
+});
+
+app.get("/health", (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    ready: client.isReady?.() || false,
+    bot: client.user?.tag || null,
+    wsStatus: client.ws?.status ?? null,
+    wsPing: client.ws?.ping ?? null,
+    uptimeSec: Math.floor(process.uptime()),
+    memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+    guilds: client.guilds?.cache?.size || 0,
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.use((_req, res) => {
+  res.status(200).send("OK");
+});
+
+const server = app.listen(PORT, () => {
+  console.log(`[WEB] Server ${PORT} portunda aktif.`);
+});
+
+server.on("error", (err) => {
+  console.error("[WEB ERROR]", err);
+});
+
+/* =================================
+   GLOBAL SAFETY / STATE
 ================================= */
 let voiceReconnectLock = false;
 let voiceReconnectTimeout = null;
 let trackedVoiceGuildId = null;
+
+let loginInProgress = false;
+let reloginTimeout = null;
+let destroyInProgress = false;
+let startupFinished = false;
+let lastReadyAt = 0;
+let lastGatewayHealthyAt = Date.now();
+
+let watchdogInterval = null;
+let cooldownCleanupInterval = null;
 
 const cooldowns = new Map();
 const COMMAND_COOLDOWN_MS = 3000;
@@ -145,62 +164,6 @@ function safeLog(...args) {
 function safeError(...args) {
   console.error(...args.map(redactSensitive));
 }
-
-process.on("unhandledRejection", (reason) => {
-  safeError("[unhandledRejection]", reason);
-});
-
-process.on("uncaughtException", (error) => {
-  safeError("[uncaughtException]", error);
-});
-
-process.on("uncaughtExceptionMonitor", (error) => {
-  safeError("[uncaughtExceptionMonitor]", error);
-});
-
-process.on("SIGTERM", async () => {
-  safeLog("[SIGTERM] Kapatılıyor...");
-  try {
-    clearReconnectTimer();
-    for (const guild of client.guilds.cache.values()) {
-      const conn = getVoiceConnection(guild.id);
-      if (conn) conn.destroy();
-    }
-    client.destroy();
-  } catch (err) {
-    safeError("[SIGTERM destroy error]", err);
-  } finally {
-    process.exit(0);
-  }
-});
-
-process.on("SIGINT", async () => {
-  safeLog("[SIGINT] Kapatılıyor...");
-  try {
-    clearReconnectTimer();
-    for (const guild of client.guilds.cache.values()) {
-      const conn = getVoiceConnection(guild.id);
-      if (conn) conn.destroy();
-    }
-    client.destroy();
-  } catch (err) {
-    safeError("[SIGINT destroy error]", err);
-  } finally {
-    process.exit(0);
-  }
-});
-
-client.on("error", (err) => {
-  safeError("[client error]", err);
-});
-
-client.on("warn", (info) => {
-  safeLog("[client warn]", info);
-});
-
-client.on("shardError", (err) => {
-  safeError("[shard error]", err);
-});
 
 /* =================================
    HELPERS
@@ -320,6 +283,68 @@ function clearReconnectTimer() {
   }
 }
 
+function clearReloginTimer() {
+  if (reloginTimeout) {
+    clearTimeout(reloginTimeout);
+    reloginTimeout = null;
+  }
+}
+
+function markGatewayHealthy() {
+  lastGatewayHealthyAt = Date.now();
+}
+
+function scheduleRelogin(delay = 10_000, reason = "Bilinmiyor") {
+  if (reloginTimeout) return;
+
+  safeLog(`[RELOGIN] ${delay}ms sonra yeniden bağlanılacak. Sebep: ${reason}`);
+
+  reloginTimeout = setTimeout(async () => {
+    reloginTimeout = null;
+    await relogin(reason);
+  }, delay);
+}
+
+async function safeDestroyClient() {
+  if (destroyInProgress) return;
+  destroyInProgress = true;
+
+  try {
+    clearReconnectTimer();
+
+    for (const guild of client.guilds.cache.values()) {
+      const conn = getVoiceConnection(guild.id);
+      if (conn) {
+        try {
+          conn.destroy();
+        } catch {}
+      }
+    }
+
+    if (client.isReady?.() || client.ws?.status != null) {
+      try {
+        client.destroy();
+      } catch (err) {
+        safeError("[CLIENT DESTROY ERROR]", err);
+      }
+    }
+  } finally {
+    destroyInProgress = false;
+  }
+}
+
+async function relogin(reason = "Bilinmiyor") {
+  if (loginInProgress) return;
+
+  safeLog(`[RELOGIN] Başlatıldı. Sebep: ${reason}`);
+
+  await safeDestroyClient();
+  await startBot();
+}
+
+/* =================================
+   VOICE
+================================= */
 async function connectToConfiguredVoice() {
   if (voiceReconnectLock) return null;
 
@@ -392,7 +417,7 @@ async function connectToConfiguredVoice() {
     });
 
     connection.on("error", (err) => {
-      safeError("[VOICE connection error]", err);
+      safeError("[VOICE CONNECTION ERROR]", err);
       scheduleVoiceReconnect();
     });
 
@@ -454,6 +479,9 @@ async function voiceWatchdog() {
   }
 }
 
+/* =================================
+   SENSITIVE MESSAGE PROTECTION
+================================= */
 async function tryDeleteSensitiveMessage(message) {
   if (!message.guild) return false;
   if (!message.deletable) return false;
@@ -477,12 +505,12 @@ async function tryDeleteSensitiveMessage(message) {
 }
 
 /* =================================
-   READY
+   PRESENCE
 ================================= */
-client.once("clientReady", async () => {
-  safeLog(`[READY] ${client.user.tag} giriş yaptı.`);
-
+async function applyPresence() {
   try {
+    if (!client.user) return;
+
     client.user.setPresence({
       status: "idle",
       activities: [
@@ -495,20 +523,170 @@ client.once("clientReady", async () => {
   } catch (err) {
     safeError("[PRESENCE ERROR]", err);
   }
+}
 
-  await connectToConfiguredVoice();
+/* =================================
+   WATCHDOGS
+================================= */
+async function gatewayWatchdog() {
+  try {
+    const now = Date.now();
+
+    if (client.isReady?.()) {
+      markGatewayHealthy();
+    }
+
+    const wsPing = client.ws?.ping;
+    const wsStatus = client.ws?.status;
+
+    if (typeof wsPing === "number" && wsPing >= 0 && wsPing < 60_000) {
+      markGatewayHealthy();
+    }
+
+    const sinceHealthy = now - lastGatewayHealthyAt;
+    const sinceReady = lastReadyAt ? now - lastReadyAt : null;
+
+    if (!startupFinished) return;
+
+    if (!client.isReady?.() && sinceHealthy > 180_000) {
+      safeError("[WATCHDOG] Client ready değil, kontrollü relogin başlatılıyor.");
+      scheduleRelogin(5_000, "Client ready değil / gateway stale");
+      return;
+    }
+
+    if (typeof wsPing === "number" && wsPing > 30_000) {
+      safeError(`[WATCHDOG] Ping aşırı yüksek: ${wsPing}ms`);
+    }
+
+    if (
+      typeof wsStatus === "number" &&
+      !client.isReady?.() &&
+      sinceHealthy > 180_000 &&
+      (sinceReady == null || sinceReady > 180_000)
+    ) {
+      scheduleRelogin(5_000, `WS status unhealthy: ${wsStatus}`);
+      return;
+    }
+
+    const memoryMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
+    if (memoryMb > 450) {
+      safeError(`[WATCHDOG] Yüksek RAM kullanımı: ${memoryMb}MB`);
+    }
+
+    await voiceWatchdog();
+  } catch (err) {
+    safeError("[WATCHDOG ERROR]", err);
+  }
+}
+
+function startIntervals() {
+  if (!watchdogInterval) {
+    watchdogInterval = setInterval(() => {
+      gatewayWatchdog();
+    }, 60_000);
+  }
+
+  if (!cooldownCleanupInterval) {
+    cooldownCleanupInterval = setInterval(() => {
+      cleanupCooldowns();
+    }, 60_000);
+  }
+}
+
+/* =================================
+   PROCESS EVENTS
+================================= */
+process.on("unhandledRejection", (reason) => {
+  safeError("[UNHANDLED REJECTION]", reason);
+});
+
+process.on("uncaughtException", (error) => {
+  safeError("[UNCAUGHT EXCEPTION]", error);
+});
+
+process.on("uncaughtExceptionMonitor", (error) => {
+  safeError("[UNCAUGHT EXCEPTION MONITOR]", error);
+});
+
+process.on("SIGTERM", async () => {
+  safeLog("[SIGTERM] Kapatılıyor...");
+  try {
+    clearReconnectTimer();
+    clearReloginTimer();
+    await safeDestroyClient();
+    server.close?.();
+  } catch (err) {
+    safeError("[SIGTERM ERROR]", err);
+  } finally {
+    process.exit(0);
+  }
+});
+
+process.on("SIGINT", async () => {
+  safeLog("[SIGINT] Kapatılıyor...");
+  try {
+    clearReconnectTimer();
+    clearReloginTimer();
+    await safeDestroyClient();
+    server.close?.();
+  } catch (err) {
+    safeError("[SIGINT ERROR]", err);
+  } finally {
+    process.exit(0);
+  }
 });
 
 /* =================================
-   INTERVALS
+   CLIENT EVENTS
 ================================= */
-setInterval(async () => {
-  await voiceWatchdog();
-}, 120_000);
+client.on("error", (err) => {
+  safeError("[CLIENT ERROR]", err);
+});
 
-setInterval(() => {
-  cleanupCooldowns();
-}, 60_000);
+client.on("warn", (info) => {
+  safeLog("[CLIENT WARN]", info);
+});
+
+client.on("shardError", (err) => {
+  safeError("[SHARD ERROR]", err);
+});
+
+client.on("shardDisconnect", (event, shardId) => {
+  safeError(`[SHARD DISCONNECT] shard=${shardId} code=${event?.code} reason=${event?.reason || "Yok"}`);
+  scheduleRelogin(10_000, "Shard disconnect");
+});
+
+client.on("shardReconnecting", (shardId) => {
+  safeLog(`[SHARD RECONNECTING] shard=${shardId}`);
+});
+
+client.on("shardResume", (shardId, replayedEvents) => {
+  safeLog(`[SHARD RESUME] shard=${shardId} replayed=${replayedEvents}`);
+  markGatewayHealthy();
+});
+
+client.on("invalidated", () => {
+  safeError("[INVALIDATED] Session invalidated.");
+  scheduleRelogin(15_000, "Session invalidated");
+});
+
+client.on("ready", async () => {
+  lastReadyAt = Date.now();
+  markGatewayHealthy();
+  startupFinished = true;
+
+  safeLog(`[READY] ${client.user.tag} giriş yaptı.`);
+  await applyPresence();
+  await connectToConfiguredVoice();
+});
+
+client.ws.on("debug", () => {
+  markGatewayHealthy();
+});
+
+client.on("raw", () => {
+  markGatewayHealthy();
+});
 
 /* =================================
    COMMANDS
@@ -727,9 +905,31 @@ client.on("messageCreate", async (message) => {
 });
 
 /* =================================
-   LOGIN
+   START / LOGIN
 ================================= */
-client.login(TOKEN).catch((err) => {
-  safeError("[LOGIN ERROR]", err);
-  process.exit(1);
-});
+async function startBot() {
+  if (loginInProgress) return;
+  loginInProgress = true;
+
+  try {
+    clearReloginTimer();
+
+    if (client.token) {
+      try {
+        await safeDestroyClient();
+      } catch {}
+    }
+
+    safeLog("[LOGIN] Discord'a bağlanılıyor...");
+    await client.login(TOKEN);
+    markGatewayHealthy();
+  } catch (err) {
+    safeError("[LOGIN ERROR]", err);
+    scheduleRelogin(15_000, "Login başarısız");
+  } finally {
+    loginInProgress = false;
+  }
+}
+
+startIntervals();
+startBot();
